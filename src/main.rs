@@ -7,22 +7,28 @@ use image::{DynamicImage, ImageBuffer, Luma};
 use image::imageops;
 use colored::Colorize;
 
+/// 获取当前时间戳，格式为 "年-月-日 时:分:秒"
 fn get_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 输出蓝色 INFO 级别日志
 fn log_info(message: &str) {
     println!("{}", format!("{} - INFO - {}", get_timestamp(), message).blue());
 }
 
+/// 输出黄色 WARNING 级别日志
 fn log_warning(message: &str) {
     println!("{}", format!("{} - WARNING - {}", get_timestamp(), message).yellow());
 }
 
+/// 输出红色 ERROR 级别日志（到标准错误流）
 fn log_error(message: &str) {
     eprintln!("{}", format!("{} - ERROR - {}", get_timestamp(), message).red());
 }
 
+/// 判断字符串是否为有效的图片 URL
+/// 支持 http/https 协议，以及 png/jpg/jpeg/gif/bmp/webp 格式
 fn is_url(path: &str) -> bool {
     let url_pattern = Regex::new(
         r"^https?://[\w-]+(\.[\w-]+)+(/\S*)?\.(png|jpg|jpeg|gif|bmp|webp)(\?\S*)?$"
@@ -30,6 +36,8 @@ fn is_url(path: &str) -> bool {
     url_pattern.is_match(path)
 }
 
+/// 从 URL 下载图片到临时文件
+/// 返回临时文件路径，失败时返回 None
 fn download_image(url: &str) -> Option<PathBuf> {
     if !is_url(url) {
         log_error(&format!("无效的 URL: {}", url));
@@ -38,6 +46,7 @@ fn download_image(url: &str) -> Option<PathBuf> {
 
     log_info(&format!("正在下载图片: {}", url));
 
+    // 创建 HTTP 客户端，设置浏览器 User-Agent 和 30 秒超时
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .timeout(std::time::Duration::from_secs(30))
@@ -51,6 +60,7 @@ fn download_image(url: &str) -> Option<PathBuf> {
         return None;
     }
 
+    // 验证 Content-Type 是否为图片类型
     let content_type = response.headers()
         .get("Content-Type")
         .and_then(|v| v.to_str().ok())
@@ -62,10 +72,12 @@ fn download_image(url: &str) -> Option<PathBuf> {
 
     let bytes = response.bytes().ok()?;
     
+    // 创建临时文件并写入图片数据
     let mut temp_file = NamedTempFile::new().ok()?;
     use std::io::Write;
     temp_file.write_all(&bytes).ok()?;
     
+    // 获取临时文件路径，防止文件被自动删除
     let path = temp_file.path().to_path_buf();
     std::mem::forget(temp_file);
     
@@ -74,17 +86,23 @@ fn download_image(url: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// 对图像进行多种预处理操作，返回预处理后的图像列表
+/// 包括：原始、灰度、对比度增强、二值化（多阈值）、模糊+二值化、锐化、颜色反转、放大
 fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     let mut images = Vec::new();
 
+    // 原始图像
     images.push(("原始图像".to_string(), img.clone()));
 
+    // 转换为灰度图像
     let gray_img = img.to_luma8();
     images.push(("灰度图像".to_string(), DynamicImage::ImageLuma8(gray_img.clone())));
 
+    // 增强对比度（2.0 倍）
     let contrast_img = imageops::contrast(&gray_img, 2.0);
     images.push(("高对比度图像".to_string(), DynamicImage::ImageLuma8(contrast_img.clone())));
 
+    // 二值化处理（阈值 128）
     let threshold = 128u8;
     let binary_img: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
         contrast_img.width(),
@@ -100,6 +118,7 @@ fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     );
     images.push(("二值化图像".to_string(), DynamicImage::ImageLuma8(binary_img)));
 
+    // 二值化处理（其他阈值：64 和 192）
     for threshold in [64u8, 192u8] {
         let binary_img: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
             contrast_img.width(),
@@ -116,6 +135,7 @@ fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
         images.push((format!("二值化图像(阈值{})", threshold), DynamicImage::ImageLuma8(binary_img)));
     }
 
+    // 高斯模糊 + 二值化
     let blurred = imageops::blur(&gray_img, 1.0);
     let blurred_binary: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
         blurred.width(),
@@ -131,10 +151,12 @@ fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     );
     images.push(("高斯模糊+二值化".to_string(), DynamicImage::ImageLuma8(blurred_binary)));
 
+    // 锐化处理
     let sharpened = img.to_rgba8();
     let sharpened = imageops::unsharpen(&sharpened, 1.0, 0);
     images.push(("锐化图像".to_string(), DynamicImage::ImageRgba8(sharpened)));
 
+    // 颜色反转
     let inverted: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
         gray_img.width(),
         gray_img.height(),
@@ -145,12 +167,15 @@ fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     );
     images.push(("颜色反转图像".to_string(), DynamicImage::ImageLuma8(inverted)));
 
+    // 图像放大（2 倍，使用 Lanczos3 算法）
     let large_img = img.resize(img.width() * 2, img.height() * 2, imageops::FilterType::Lanczos3);
     images.push(("放大图像".to_string(), large_img));
 
     images
 }
 
+/// 尝试解码单个图像中的二维码
+/// 成功时返回二维码内容，失败时返回 None
 fn decode_qr_image(img: &DynamicImage) -> Option<String> {
     let results = bardecoder::default_decoder().decode(img);
     
@@ -165,6 +190,8 @@ fn decode_qr_image(img: &DynamicImage) -> Option<String> {
     None
 }
 
+/// 解码指定图片路径中的二维码
+/// 采用多种预处理方法和裁剪策略提高识别率
 fn decode_qrcode(image_path: &PathBuf) {
     log_info(&format!("开始解码二维码: {}", image_path.display()));
 
@@ -176,6 +203,7 @@ fn decode_qrcode(image_path: &PathBuf) {
         }
     };
 
+    // 尝试所有预处理后的图像
     let processed_images = preprocess_image(&img);
     
     for (name, processed_img) in &processed_images {
@@ -186,11 +214,13 @@ fn decode_qrcode(image_path: &PathBuf) {
         }
     }
 
+    // 再次尝试原始图像
     if let Some(text) = decode_qr_image(&img) {
         log_info(&format!("二维码内容: {}", text));
         return;
     }
 
+    // 预处理失败，尝试裁剪图像四角
     log_warning("标准方法未能解码二维码，尝试额外的处理方法");
 
     let width = img.width();
@@ -216,6 +246,7 @@ fn decode_qrcode(image_path: &PathBuf) {
     log_info("建议：确保二维码清晰完整，或尝试使用专门的二维码应用扫描");
 }
 
+/// 处理单个输入路径（本地路径或 URL）
 fn process_input(input_path: &str) {
     let mut downloaded_path: Option<PathBuf> = None;
     
@@ -231,11 +262,13 @@ fn process_input(input_path: &str) {
         decode_qrcode(&PathBuf::from(input_path));
     }
 
+    // 清理下载的临时文件
     if let Some(path) = downloaded_path {
         let _ = std::fs::remove_file(path);
     }
 }
 
+/// 主函数：程序入口
 fn main() {
     print!("请输入二维码图片的路径或 URL（多个用逗号分隔）: ");
     io::stdout().flush().expect("无法刷新输出缓冲区");
@@ -250,6 +283,7 @@ fn main() {
         std::process::exit(1);
     }
 
+    // 按逗号分割输入，去除空白并过滤空字符串
     let paths: Vec<&str> = input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
 
     if paths.is_empty() {
@@ -257,6 +291,7 @@ fn main() {
         std::process::exit(1);
     }
 
+    // 依次处理每个路径
     for (i, path_str) in paths.iter().enumerate() {
         if paths.len() > 1 {
             log_info(&format!("正在处理第 {} 个: {}", i + 1, path_str));
