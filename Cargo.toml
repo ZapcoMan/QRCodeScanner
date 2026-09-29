@@ -1,0 +1,8 @@
+[package]
+name = "Demo20260929"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.6.7"
+tokio = "1.53.1"
