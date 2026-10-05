@@ -47,13 +47,25 @@ fn download_image(url: &str) -> Option<PathBuf> {
     log_info(&format!("正在下载图片: {}", url));
 
     // 创建 HTTP 客户端，设置浏览器 User-Agent 和 30 秒超时
-    let client = reqwest::blocking::Client::builder()
+    let client = match reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .ok()?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log_error(&format!("创建 HTTP 客户端失败: {}", e));
+            return None;
+        }
+    };
 
-    let response = client.get(url).send().ok()?;
+    let response = match client.get(url).send() {
+        Ok(r) => r,
+        Err(e) => {
+            log_error(&format!("网络请求失败: {}", e));
+            return None;
+        }
+    };
     
     if !response.status().is_success() {
         log_error(&format!("HTTP 错误: {}", response.status()));
@@ -70,12 +82,27 @@ fn download_image(url: &str) -> Option<PathBuf> {
         log_warning(&format!("URL 内容不是图片类型: {}", content_type));
     }
 
-    let bytes = response.bytes().ok()?;
+    let bytes = match response.bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            log_error(&format!("读取响应体失败: {}", e));
+            return None;
+        }
+    };
     
     // 创建临时文件并写入图片数据
-    let mut temp_file = NamedTempFile::new().ok()?;
+    let mut temp_file = match NamedTempFile::new() {
+        Ok(f) => f,
+        Err(e) => {
+            log_error(&format!("创建临时文件失败: {}", e));
+            return None;
+        }
+    };
     use std::io::Write;
-    temp_file.write_all(&bytes).ok()?;
+    if let Err(e) = temp_file.write_all(&bytes) {
+        log_error(&format!("写入临时文件失败: {}", e));
+        return None;
+    }
     
     // 获取临时文件路径，防止文件被自动删除
     let path = temp_file.path().to_path_buf();
