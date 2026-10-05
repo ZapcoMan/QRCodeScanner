@@ -28,10 +28,11 @@ fn log_error(message: &str) {
 }
 
 /// 判断字符串是否为有效的图片 URL
-/// 支持 http/https 协议，以及 png/jpg/jpeg/gif/bmp/webp 格式
+/// 支持 http/https 协议，大小写不敏感的 png/jpg/jpeg/gif/bmp/webp 扩展名
+/// 同时兼容带端口、预签名 query、页内锚点 fragment 等常见形式
 fn is_url(path: &str) -> bool {
     let url_pattern = Regex::new(
-        r"^https?://[\w-]+(\.[\w-]+)+(/\S*)?\.(png|jpg|jpeg|gif|bmp|webp)(\?\S*)?$"
+        r"(?i)^https?://\S+\.(png|jpg|jpeg|gif|bmp|webp)(\?\S*)?(#\S*)?$"
     ).unwrap();
     url_pattern.is_match(path)
 }
@@ -318,5 +319,123 @@ fn main() {
             log_info(&format!("正在处理第 {} 个: {}", i + 1, path_str));
         }
         process_input(path_str);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgb};
+
+    /// 构造一张纯色小图，用于不依赖网络的单元测试
+    fn solid_image(w: u32, h: u32, color: [u8; 3]) -> DynamicImage {
+        let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(w, h, Rgb(color));
+        DynamicImage::ImageRgb8(buf)
+    }
+
+    #[test]
+    fn test_get_timestamp_format() {
+        let ts = get_timestamp();
+        // 预期格式：YYYY-MM-DD HH:MM:SS，固定 19 个字符
+        assert_eq!(ts.len(), 19, "时间戳长度应为 19，实际: {}", ts);
+        let b = ts.as_bytes();
+        assert_eq!(b[4], b'-');
+        assert_eq!(b[7], b'-');
+        assert_eq!(b[10], b' ');
+        assert_eq!(b[13], b':');
+        assert_eq!(b[16], b':');
+        // 前 4 位与中间日期位都应为数字
+        assert!(b[..4].iter().all(|c| c.is_ascii_digit()));
+        assert!(b[11..13].iter().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_is_url_accepts_common_image_urls() {
+        assert!(is_url("https://example.com/qrcode.png"));
+        assert!(is_url("http://example.com/a.jpg"));
+        assert!(is_url("https://cdn.example.com/dir/sub/file.jpeg"));
+        assert!(is_url("https://sub.example.com/file.gif"));
+        assert!(is_url("https://example.com/file.bmp"));
+        assert!(is_url("https://example.com/file.webp"));
+    }
+
+    #[test]
+    fn test_is_url_supports_query_fragment_port_and_case() {
+        // 带查询参数（如预签名 URL）
+        assert!(is_url("https://example.com/image.png?token=abc123"));
+        assert!(is_url(
+            "https://s3.amazonaws.com/bucket/key.png?X-Amz-Signature=abc&X-Amz-Expires=3600"
+        ));
+        // 带 fragment
+        assert!(is_url("https://example.com/image.png#section"));
+        // 带端口
+        assert!(is_url("https://example.com:8080/image.png"));
+        // 大写扩展名（本次修复重点）
+        assert!(is_url("https://example.com/IMAGE.PNG"));
+        assert!(is_url("https://example.com/photo.JPEG"));
+    }
+
+    #[test]
+    fn test_is_url_rejects_invalid_inputs() {
+        assert!(!is_url(""));
+        assert!(!is_url("not a url"));
+        assert!(!is_url("/local/path/file.png"));
+        assert!(!is_url("C:\\path\\to\\file.png"));
+        assert!(!is_url("ftp://example.com/a.png"));
+        assert!(!is_url("https://example.com/a.txt"));
+        assert!(!is_url("https://example.com/a.png.txt"));
+        assert!(!is_url("https://example.com"));
+        assert!(!is_url("https://"));
+    }
+
+    #[test]
+    fn test_preprocess_image_returns_ten_variants() {
+        // 包含：原始、灰度、高对比度、二值化(128)、二值化(64)、二值化(192)、高斯模糊+二值化、锐化、反色、放大
+        let img = solid_image(8, 8, [128, 128, 128]);
+        let processed = preprocess_image(&img);
+        assert_eq!(processed.len(), 10);
+
+        let names: Vec<&str> = processed.iter().map(|(n, _)| n.as_str()).collect();
+        // 验证首项为原始图像，避免回归删除之前重复解码时丢失基础入口
+        assert_eq!(names[0], "原始图像");
+        for expected in [
+            "灰度图像",
+            "高对比度图像",
+            "二值化图像",
+            "二值化图像(阈值64)",
+            "二值化图像(阈值192)",
+            "高斯模糊+二值化",
+            "锐化图像",
+            "颜色反转图像",
+            "放大图像",
+        ] {
+            assert!(names.contains(&expected), "缺少预处理变体: {}", expected);
+        }
+    }
+
+    #[test]
+    fn test_preprocess_image_upscaled_doubles_size() {
+        let img = solid_image(16, 10, [0, 0, 0]);
+        let processed = preprocess_image(&img);
+        let large = processed
+            .iter()
+            .find(|(n, _)| n == "放大图像")
+            .expect("应存在放大图像变体");
+        assert_eq!(large.1.width(), 32);
+        assert_eq!(large.1.height(), 20);
+    }
+
+    #[test]
+    fn test_decode_qr_image_blank_returns_none() {
+        // 全白图不会包含二维码
+        let img = solid_image(32, 32, [255, 255, 255]);
+        assert!(decode_qr_image(&img).is_none());
+    }
+
+    #[test]
+    fn test_download_image_rejects_invalid_url_without_network() {
+        // 非法 URL 应直接拒绝，不会发起实际网络请求
+        assert!(download_image("not-a-valid-url").is_none());
+        assert!(download_image("/local/path.png").is_none());
     }
 }
