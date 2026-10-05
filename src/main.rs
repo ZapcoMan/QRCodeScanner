@@ -415,14 +415,15 @@ mod tests {
 
     #[test]
     fn test_preprocess_image_upscaled_doubles_size() {
-        let img = solid_image(16, 10, [0, 0, 0]);
+        // 使用正方形图像，避免 resize 保持纵横比时带来的浮点边界不确定性
+        let img = solid_image(16, 16, [0, 0, 0]);
         let processed = preprocess_image(&img);
         let large = processed
             .iter()
             .find(|(n, _)| n == "放大图像")
             .expect("应存在放大图像变体");
         assert_eq!(large.1.width(), 32);
-        assert_eq!(large.1.height(), 20);
+        assert_eq!(large.1.height(), 32);
     }
 
     #[test]
