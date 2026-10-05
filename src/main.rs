@@ -230,7 +230,7 @@ fn decode_qrcode(image_path: &PathBuf) {
         }
     };
 
-    // 尝试所有预处理后的图像
+    // 尝试所有预处理后的图像（列表首项即为"原始图像"，无需额外重复解码）
     let processed_images = preprocess_image(&img);
     
     for (name, processed_img) in &processed_images {
@@ -239,12 +239,6 @@ fn decode_qrcode(image_path: &PathBuf) {
             log_info(&format!("二维码内容: {}", text));
             return;
         }
-    }
-
-    // 再次尝试原始图像
-    if let Some(text) = decode_qr_image(&img) {
-        log_info(&format!("二维码内容: {}", text));
-        return;
     }
 
     // 预处理失败，尝试裁剪图像四角
