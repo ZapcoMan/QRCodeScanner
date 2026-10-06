@@ -1,12 +1,12 @@
-# QR Code Scanner
+# Barcode Scanner
 
 ![Rust](https://img.shields.io/badge/Rust-Edition%202024-orange)
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue)
-![Version](https://img.shields.io/badge/Version-v1.0.0-brightgreen)
-![Tests](https://img.shields.io/badge/Tests-8%20passed-success)
+![Version](https://img.shields.io/badge/Version-v1.1.0-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-10%20passed-success)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-**基于 Rust 的高性能命令行二维码解码工具，内置 10 级图像预处理与 4 路裁剪重试**
+**基于 Rust 的高性能命令行条码解码工具，支持二维码与一维条形码，内置 10 级图像预处理 + 四角裁剪 + 水平条带扫描**
 
 [快速开始](#-快速开始) • [使用说明](#-使用说明) • [技术细节](#-技术细节) • [测试说明](#-测试说明)
 
@@ -14,25 +14,27 @@
 
 ## 📌 项目简介
 
-QR Code Scanner 是一款专注于识别率的命令行二维码解码工具，支持本地图片与网络 URL 双通道输入，通过多级图像预处理策略大幅提升复杂场景下的解码成功率。
+Barcode Scanner 是一款专注于识别率的命令行条码解码工具，支持二维码（QR Code）和一维条形码（EAN-13、Code 128、UPC-A 等 20+ 种格式），支持本地图片与网络 URL 双通道输入，通过多级图像预处理策略大幅提升复杂场景下的解码成功率。
 
 ### ✨ 核心特性
 
+- 📊 **多格式支持**：QR Code、EAN-13/8、UPC-A/E、Code 128/39/93、ITF、Data Matrix、Aztec、PDF417 等 20+ 种条码格式
 - 🖥️ **双通道输入**：支持本地文件路径与 http / https URL，两者可混合批量使用
 - 📦 **批量处理**：英文逗号分隔多个输入，一次运行解码多张图片
 - 🔧 **10 级图像预处理**：原始 → 灰度 → 高对比度 → 多阈值二值化 → 高斯模糊 → 锐化 → 反色 → 2× 放大，逐级降级重试
-- ✂️ **4 路四角裁剪**：标准预处理全部失败后，自动裁剪图像四角各 1/4 区域重试
+- ✂️ **四角裁剪 + 水平条带扫描**：标准预处理失败后，自动裁剪四角并滑动水平条带重试
+- 🏷️ **格式识别输出**：解码成功时显示条码类型（如 “EAN-13 商品条码”、“Code 128 条码”）
 - 🌐 **自动下载**：识别 URL 后自动下载至临时文件，解码结束后自动清理
 - 🎨 **彩色分级日志**：INFO（蓝）/ WARNING（黄）/ ERROR（红），精确到每个失败环节
 - 🪟 **双击可用**：Windows 双击启动时由 PowerShell 接管窗口，解码输出不会闪退消失
-- ✅ **完整单元测试**：8 项测试覆盖 URL 判定、图像预处理与解码器，全部无需联网
+- ✅ **完整单元测试**：10 项测试覆盖 URL 判定、图像预处理、解码器与格式名称映射
 
 ### 🛠 技术栈
 
 | 分类           | 技术                                                           |
 |----------------|----------------------------------------------------------------|
 | **语言**       | Rust（Edition 2024）                                           |
-| **解码核心**   | bardecoder 0.4                                                 |
+| **解码核心**   | rxing 0.9（ZXing Rust 移植，支持 20+ 条码格式）          |
 | **图像处理**   | image 0.24（PNG / JPG / GIF / BMP / WEBP）                     |
 | **网络请求**   | reqwest 0.12（blocking 模式，30 s 超时）                       |
 | **URL 校验**   | regex 1.11                                                     |
@@ -79,7 +81,7 @@ cargo run
 程序启动后出现提示符，输入一行文本（多个路径以英文逗号分隔）：
 
 ```text
-请输入二维码图片的路径或 URL（多个用逗号分隔）:
+请输入条码图片的路径或 URL（支持二维码和条形码，多个用逗号分隔）:
 ```
 
 ### 输入格式
@@ -102,17 +104,27 @@ URL 同时兼容带端口（`:8080`）、查询参数（`?token=xxx`）与页内
 
 **✅ 成功解码**
 ```text
-2026-10-05 12:00:01 - INFO - 开始解码二维码: C:\path\to\qrcode.png
+2026-10-05 12:00:01 - INFO - 开始解码: C:\path\to\qrcode.png
 2026-10-05 12:00:01 - INFO - 使用 原始图像 成功解码
-2026-10-05 12:00:01 - INFO - 二维码内容: HelloQRCode
+2026-10-05 12:00:01 - INFO - 条码格式: 二维码 (QR Code)
+2026-10-05 12:00:01 - INFO - 解码内容: HelloQRCode
+```
+
+**✅ 条形码解码**
+```text
+2026-10-05 12:00:01 - INFO - 开始解码: C:\path\to\barcode.jpg
+2026-10-05 12:00:02 - INFO - 使用 灰度图像 成功解码
+2026-10-05 12:00:02 - INFO - 条码格式: EAN-13 商品条码
+2026-10-05 12:00:02 - INFO - 解码内容: 6901234567892
 ```
 
 **⚠️ 解码失败**
 ```text
-2026-10-05 12:00:01 - INFO - 开始解码二维码: C:\path\to\damaged.png
-2026-10-05 12:00:05 - WARNING - 标准方法未能解码二维码，尝试额外的处理方法
-2026-10-05 12:00:06 - ERROR - 经过所有尝试后仍然无法解码二维码
-2026-10-05 12:00:06 - INFO - 建议：确保二维码清晰完整，或尝试使用专门的二维码应用扫描
+2026-10-05 12:00:01 - INFO - 开始解码: C:\path\to\damaged.png
+2026-10-05 12:00:05 - WARNING - 标准方法未能解码，尝试额外的裁剪处理方法
+2026-10-05 12:00:06 - WARNING - 裁剪方法未能解码，尝试水平条带扫描
+2026-10-05 12:00:07 - ERROR - 经过所有尝试后仍然无法解码
+2026-10-05 12:00:07 - INFO - 建议：确保条码清晰完整，光照均匀，或尝试使用专业扫码应用
 ```
 
 ---
@@ -142,8 +154,8 @@ main()
   ├─ 读取用户输入（逗号分隔多个路径 / URL）
   ├─ 对每个输入调用 process_input()
   │     ├─ is_url()             判断 URL 还是本地路径
-  │     ├─ [URL]  download_image() → 临时文件 → decode_qrcode() → 清理
-  │     └─ [本地] decode_qrcode()
+  │     ├─ [URL]  download_image() → 临时文件 → decode_image() → 清理
+  │     └─ [本地] decode_image()
   └─ keep_console_open()        双击启动时把窗口交给 PowerShell
 ```
 
@@ -164,9 +176,12 @@ main()
 | 9  | 颜色反转图像           | 灰度每像素 `255 - v`          |
 | 10 | 放大图像               | 2× Lanczos3 放大              |
 
-### 四角裁剪策略
+### 四角裁剪 + 水平条带扫描
 
-若所有预处理变体均失败，输出 WARNING 日志后对图像四角各裁剪 1/4 重试：
+若所有预处理变体均失败，输出 WARNING 日志后执行：
+
+1. **四角裁剪**：对图像四角各裁剪 1/4 区域重试
+2. **水平条带扫描**：将图像按 1/6 高度切片，50% 重叠滑动扫描（特别适用于一维条形码）
 
 | 区域   | 裁剪坐标 (x, y, x2, y2)            |
 |--------|------------------------------------|
@@ -221,7 +236,7 @@ main()
 
 ## 🧪 测试说明
 
-项目包含 **8 个不依赖网络的单元测试**，覆盖 URL 判定、图像预处理与解码器核心逻辑。
+项目包含 **10 个不依赖网络的单元测试**，覆盖 URL 判定、图像预处理、解码器与格式名称映射。
 
 | 测试函数                                                  | 验证内容                                   |
 |-----------------------------------------------------------|--------------------------------------------|
@@ -229,9 +244,11 @@ main()
 | `test_is_url_accepts_common_image_urls`                   | 6 种常见图片扩展名的正例                   |
 | `test_is_url_supports_query_fragment_port_and_case`       | 端口 / 查询参数 / fragment / 大写扩展名    |
 | `test_is_url_rejects_invalid_inputs`                      | 9 个反例（本地路径、错误协议、无扩展名等） |
-| `test_preprocess_image_returns_ten_variants`              | 预处理列表长度为 10，首项为"原始图像"      |
+| `test_preprocess_image_returns_ten_variants`              | 预处理列表长度为 10，首项为“原始图像”      |
 | `test_preprocess_image_upscaled_doubles_size`             | 16×16 → 32×32 放大语义                     |
-| `test_decode_qr_image_blank_returns_none`                 | 空白图应返回 None                          |
+| `test_decode_barcode_image_blank_returns_none`            | 空白图应返回 None                          |
+| `test_format_display_name_common_variants`                | 常见条码格式的中文名称映射                 |
+| `test_format_display_name_unknown_fallback`               | 未定义格式回退为“未知格式”                 |
 | `test_download_image_rejects_invalid_url_without_network` | 非法 URL 不发网络请求即返回 None           |
 
 **快速运行：**
@@ -261,9 +278,9 @@ v1.0.0 已内置控制台守卫，正常情况下不会闪退。若仍有问题�
 
 检查网络连接，确认可访问目标 URL。程序 HTTP 超时设置为 30 秒，部分慢速 CDN 可能超时。
 
-### 5. 二维码解码失败
+### 5. 条码解码失败
 
-确保图片清晰完整、无严重遮挡。低质量图片可能需要多帧预处理重试，耐心等待日志输出即可。
+确保图片清晰完整、无严重遮挡。一维条形码拍摄时建议保持图片水平，避免倾斜过大。低质量图片可能需要多级预处理重试，耐心等待日志输出即可。
 
 ---
 
