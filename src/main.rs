@@ -1,33 +1,91 @@
 use std::path::PathBuf;
 use std::ffi::OsStr;
-use std::io::{self, BufRead, Write};
+use std::cell::RefCell;
+use std::io::{self, BufRead, Cursor, Read, Write};
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 use chrono::Local;
 use regex::Regex;
 use tempfile::NamedTempFile;
-use image::{DynamicImage, ImageBuffer, Luma};
+use image::{DynamicImage, ImageBuffer, ImageDecoder, ImageFormat, Luma};
 use image::imageops;
 use colored::Colorize;
-use rxing::helpers::detect_in_luma_slice;
-use rxing::BarcodeFormat;
+use rxing::helpers::detect_in_luma_slice_with_hints;
+use rxing::{BarcodeFormat, DecodeHints};
 
 /// 获取当前时间戳，格式为 "年-月-日 时:分:秒"
 fn get_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 一条已格式化的日志：着色后的文本 + 应输出到标准输出还是标准错误
+struct CapturedLog {
+    line: String,
+    to_stderr: bool,
+}
+
+thread_local! {
+    /// 当前线程的日志捕获栈。并行处理多图时，每张图片在自己的工作线程内
+    /// 开启一层捕获，将日志累积到栈顶缓冲，结束后由主线程按输入顺序统一打印。
+    /// 栈为空时（串行/普通调用）日志直接打印，行为与以往一致；栈结构天然支持嵌套。
+    static LOG_CAPTURE: RefCell<Vec<Vec<CapturedLog>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 输出一行日志：若当前线程处于捕获模式则存入栈顶缓冲，否则直接打印
+fn emit(line: String, to_stderr: bool) {
+    let captured = LOG_CAPTURE.with(|c| {
+        let mut stack = c.borrow_mut();
+        if let Some(top) = stack.last_mut() {
+            top.push(CapturedLog { line: line.clone(), to_stderr });
+            true
+        } else {
+            false
+        }
+    });
+    if !captured {
+        if to_stderr {
+            eprintln!("{}", line);
+        } else {
+            println!("{}", line);
+        }
+    }
+}
+
 /// 输出蓝色 INFO 级别日志
 fn log_info(message: &str) {
-    println!("{}", format!("{} - INFO - {}", get_timestamp(), message).blue());
+    emit(format!("{} - INFO - {}", get_timestamp(), message).blue().to_string(), false);
 }
 
 /// 输出黄色 WARNING 级别日志
 fn log_warning(message: &str) {
-    println!("{}", format!("{} - WARNING - {}", get_timestamp(), message).yellow());
+    emit(format!("{} - WARNING - {}", get_timestamp(), message).yellow().to_string(), false);
 }
 
 /// 输出红色 ERROR 级别日志（到标准错误流）
 fn log_error(message: &str) {
-    eprintln!("{}", format!("{} - ERROR - {}", get_timestamp(), message).red());
+    emit(format!("{} - ERROR - {}", get_timestamp(), message).red().to_string(), true);
+}
+
+/// 在捕获模式下运行 f：期间所有 log_* 输出被收集而非直接打印
+/// 返回 f 的结果与被捕获的日志列表（供主线程按序打印）
+fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<CapturedLog>) {
+    LOG_CAPTURE.with(|c| c.borrow_mut().push(Vec::new()));
+    let result = f();
+    let logs = LOG_CAPTURE.with(|c| c.borrow_mut().pop()).unwrap_or_default();
+    (result, logs)
+}
+
+/// 将捕获到的日志按顺序刷回真实输出
+fn flush_captured_logs(logs: Vec<CapturedLog>) {
+    for entry in logs {
+        if entry.to_stderr {
+            eprintln!("{}", entry.line);
+        } else {
+            println!("{}", entry.line);
+        }
+    }
 }
 
 /// 判断字符串是否为有效的图片 URL
@@ -117,68 +175,49 @@ fn download_image(url: &str) -> Option<PathBuf> {
 }
 
 /// 对图像进行多种预处理操作，返回预处理后的图像列表
-/// 包括：原始、灰度、对比度增强、二值化（多阈值）、模糊+二值化、锐化、颜色反转、放大
+/// 包括：原始、对比度增强、二值化（多阈值）、模糊+二值化、锐化、颜色反转、放大（仅小图）
 fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     let mut images = Vec::new();
 
-    // 原始图像
+    // 原始图像（解码器内部会自行转灰度，无需再单独提供一份灰度变体）
     images.push(("原始图像".to_string(), img.clone()));
 
-    // 转换为灰度图像
+    // 转换为灰度图像（供后续模糊、反转等变体使用）
     let gray_img = img.to_luma8();
-    images.push(("灰度图像".to_string(), DynamicImage::ImageLuma8(gray_img.clone())));
 
     // 增强对比度（2.0 倍）
     let contrast_img = imageops::contrast(&gray_img, 2.0);
     images.push(("高对比度图像".to_string(), DynamicImage::ImageLuma8(contrast_img.clone())));
 
-    // 二值化处理（阈值 128）
-    let threshold = 128u8;
-    let binary_img: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
-        contrast_img.width(),
-        contrast_img.height(),
-        |x, y| {
-            let pixel = contrast_img.get_pixel(x, y);
-            if pixel[0] < threshold {
-                Luma([0u8])
-            } else {
-                Luma([255u8])
-            }
-        }
-    );
-    images.push(("二值化图像".to_string(), DynamicImage::ImageLuma8(binary_img)));
-
-    // 二值化处理（其他阈值：64 和 192）
-    for threshold in [64u8, 192u8] {
-        let binary_img: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
-            contrast_img.width(),
-            contrast_img.height(),
-            |x, y| {
-                let pixel = contrast_img.get_pixel(x, y);
-                if pixel[0] < threshold {
-                    Luma([0u8])
-                } else {
-                    Luma([255u8])
-                }
-            }
-        );
-        images.push((format!("二值化图像(阈值{})", threshold), DynamicImage::ImageLuma8(binary_img)));
+    // 二值化处理（阈值 128 / 64 / 192）
+    // 直接对原始字节做映射，避免逐像素 get_pixel 的边界检查开销
+    let contrast_raw = contrast_img.as_raw();
+    let (cw, ch) = (contrast_img.width(), contrast_img.height());
+    for threshold in [128u8, 64u8, 192u8] {
+        let data: Vec<u8> = contrast_raw
+            .iter()
+            .map(|&v| if v < threshold { 0u8 } else { 255u8 })
+            .collect();
+        let binary_img = ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(cw, ch, data)
+            .expect("二值化数据长度应与图像尺寸一致");
+        let name = if threshold == 128 {
+            "二值化图像".to_string()
+        } else {
+            format!("二值化图像(阈值{})", threshold)
+        };
+        images.push((name, DynamicImage::ImageLuma8(binary_img)));
     }
 
     // 高斯模糊 + 二值化
     let blurred = imageops::blur(&gray_img, 1.0);
-    let blurred_binary: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
-        blurred.width(),
-        blurred.height(),
-        |x, y| {
-            let pixel = blurred.get_pixel(x, y);
-            if pixel[0] < 128 {
-                Luma([0u8])
-            } else {
-                Luma([255u8])
-            }
-        }
-    );
+    let blurred_data: Vec<u8> = blurred
+        .as_raw()
+        .iter()
+        .map(|&v| if v < 128 { 0u8 } else { 255u8 })
+        .collect();
+    let blurred_binary =
+        ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(blurred.width(), blurred.height(), blurred_data)
+            .expect("模糊二值化数据长度应与图像尺寸一致");
     images.push(("高斯模糊+二值化".to_string(), DynamicImage::ImageLuma8(blurred_binary)));
 
     // 锐化处理
@@ -187,19 +226,18 @@ fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     images.push(("锐化图像".to_string(), DynamicImage::ImageRgba8(sharpened)));
 
     // 颜色反转
-    let inverted: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(
-        gray_img.width(),
-        gray_img.height(),
-        |x, y| {
-            let pixel = gray_img.get_pixel(x, y);
-            Luma([255u8 - pixel[0]])
-        }
-    );
+    let inverted_data: Vec<u8> = gray_img.as_raw().iter().map(|&v| 255u8 - v).collect();
+    let inverted =
+        ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(gray_img.width(), gray_img.height(), inverted_data)
+            .expect("反转数据长度应与图像尺寸一致");
     images.push(("颜色反转图像".to_string(), DynamicImage::ImageLuma8(inverted)));
 
     // 图像放大（2 倍，使用 Lanczos3 算法）
-    let large_img = img.resize(img.width() * 2, img.height() * 2, imageops::FilterType::Lanczos3);
-    images.push(("放大图像".to_string(), large_img));
+    // 仅对小图有效：大图放大产生 4 倍像素，既拖慢解码又几乎不提升识别率
+    if img.width().max(img.height()) < 900 {
+        let large_img = img.resize(img.width() * 2, img.height() * 2, imageops::FilterType::Lanczos3);
+        images.push(("放大图像".to_string(), large_img));
+    }
 
     images
 }
@@ -210,95 +248,311 @@ struct DecodeResult {
     format: BarcodeFormat,
 }
 
-/// 将 DynamicImage 转换为灰度数据并尝试解码（二维码 + 条形码）
-/// 成功时返回解码结果（含格式信息），失败时返回 None
-fn decode_barcode_image(img: &DynamicImage) -> Option<DecodeResult> {
+/// 一维条码候选格式（含 PDF417 堆叠式条码）
+/// 水平条带扫描时只尝试这些格式，跳过重量级的 2D 解码器，显著提速
+fn oned_barcode_formats() -> Vec<BarcodeFormat> {
+    vec![
+        BarcodeFormat::EAN_13,
+        BarcodeFormat::EAN_8,
+        BarcodeFormat::UPC_A,
+        BarcodeFormat::UPC_E,
+        BarcodeFormat::CODE_128,
+        BarcodeFormat::CODE_39,
+        BarcodeFormat::CODE_93,
+        BarcodeFormat::CODABAR,
+        BarcodeFormat::ITF,
+        BarcodeFormat::RSS_14,
+        BarcodeFormat::RSS_EXPANDED,
+        BarcodeFormat::TELEPEN,
+        BarcodeFormat::UPC_EAN_EXTENSION,
+        BarcodeFormat::PDF_417,
+    ]
+}
+
+/// 按指定候选格式集合解码图像；formats 为 None 时尝试所有格式
+/// try_harder 控制 rxing 是否投入更多搜索时间（false = 速度优先）
+fn decode_barcode_image_with(
+    img: &DynamicImage,
+    formats: Option<&[BarcodeFormat]>,
+    try_harder: bool,
+) -> Option<DecodeResult> {
     let luma = img.to_luma8();
     let (width, height) = (luma.width(), luma.height());
-    let luma_data: &[u8] = luma.as_raw();
 
-    match detect_in_luma_slice(luma_data, width, height, None) {
-        Ok(result) => {
-            let text = result.getText().to_string();
-            if !text.is_empty() {
-                return Some(DecodeResult {
-                    text,
-                    format: *result.getBarcodeFormat(),
-                });
-            }
+    let mut hints = DecodeHints::default();
+    if let Some(fmts) = formats {
+        hints.PossibleFormats = Some(fmts.iter().copied().collect::<HashSet<BarcodeFormat>>());
+    }
+    hints.TryHarder = Some(try_harder);
+
+    if let Ok(result) =
+        detect_in_luma_slice_with_hints(luma.as_raw(), width, height, None, &mut hints)
+    {
+        let text = result.getText().to_string();
+        if !text.is_empty() {
+            return Some(DecodeResult {
+                text,
+                format: *result.getBarcodeFormat(),
+            });
         }
-        Err(_) => {}
     }
 
     None
 }
 
+/// 并行级联中的单个解码任务
+struct DecodeJob {
+    desc: String,
+    image: DynamicImage,
+    formats: Option<Vec<BarcodeFormat>>,
+}
+
+/// 多线程并行执行解码任务：任意线程首个成功即作为结果，
+/// 其他线程在任务间检查完成标志后提前退出
+fn run_jobs_parallel(jobs: Vec<DecodeJob>) -> Option<(String, DecodeResult)> {
+    if jobs.is_empty() {
+        return None;
+    }
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(jobs.len());
+
+    let next_index = AtomicUsize::new(0);
+    let finished = AtomicBool::new(false);
+    let winner: Mutex<Option<(String, DecodeResult)>> = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for _ in 0..thread_count {
+            scope.spawn(|| {
+                loop {
+                    if finished.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= jobs.len() {
+                        break;
+                    }
+                    let job = &jobs[index];
+                    let result =
+                        decode_barcode_image_with(&job.image, job.formats.as_deref(), true);
+                    if let Some(decoded) = result {
+                        let mut guard = winner.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some((job.desc.clone(), decoded));
+                            finished.store(true, Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    winner.into_inner().unwrap()
+}
+
+/// 执行完整解码策略：缩小快速通道 → 并行级联（预处理/裁剪/条带）→ 全尺寸原图兜底尝试
+/// 成功时返回 (策略描述, 解码结果)，全部失败返回 None
+fn try_decode_image(img: &mut DynamicImage) -> Option<(String, DecodeResult)> {
+    let width = img.width();
+    let height = img.height();
+
+    // 级联统一在长边 ≤1600px 的工作图上进行：
+    // 手机照片常有数千万像素，全尺寸反复解码是主要耗时来源，
+    // 缩小后条码模块宽度通常仍≥ 3px，不影响解码
+    // （若加载阶段已采样解码到 ≈CASCADE_MAX_DIM，此处会自然跳过缩放）
+    let downscaled = width.max(height) > CASCADE_MAX_DIM;
+    let t_resize = Instant::now();
+    let mut work_img = if downscaled {
+        img.resize(CASCADE_MAX_DIM, CASCADE_MAX_DIM, imageops::FilterType::Triangle)
+    } else {
+        img.clone()
+    };
+    if downscaled {
+        log_info(&format!(
+            "工作图缩放至 {}x{}，耗时 {} ms",
+            work_img.width(),
+            work_img.height(),
+            t_resize.elapsed().as_millis()
+        ));
+    }
+
+    // 快速通道：工作图低强度一次解码（TryHarder 关闭），清晰图片通常在此即命中
+    let t_fast = Instant::now();
+    if let Some(result) = decode_barcode_image_with(&work_img, None, false) {
+        log_info(&format!("快速通道解码耗时 {} ms", t_fast.elapsed().as_millis()));
+        return Some(("快速通道解码成功（工作图像）".to_string(), result));
+    }
+    log_info(&format!("快速通道未命中，耗时 {} ms", t_fast.elapsed().as_millis()));
+
+    log_warning("快速通道未能解码，进入并行级联尝试");
+
+    // 收集全部候选任务：预处理变体 + 角部裁剪 + 水平条带，一次性并行执行
+    let t_cascade = Instant::now();
+    let (work_width, work_height) = (work_img.width(), work_img.height());
+    let mut jobs: Vec<DecodeJob> = Vec::new();
+
+    for (name, processed_img) in preprocess_image(&work_img) {
+        jobs.push(DecodeJob {
+            desc: format!("使用 {} 成功解码", name),
+            image: processed_img,
+            formats: None,
+        });
+    }
+
+    let crops = [
+        ("左上角", (0, 0, work_width / 2, work_height / 2)),
+        ("右上角", (work_width / 2, 0, work_width, work_height / 2)),
+        ("左下角", (0, work_height / 2, work_width / 2, work_height)),
+        ("右下角", (work_width / 2, work_height / 2, work_width, work_height)),
+    ];
+
+    for (name, (x, y, x2, y2)) in &crops {
+        let cropped = work_img.crop(*x, *y, x2 - *x, y2 - *y);
+        jobs.push(DecodeJob {
+            desc: format!("在裁剪区域 {} 中成功解码", name),
+            image: cropped,
+            formats: None,
+        });
+    }
+
+    // 水平条带只尝试一维格式，跳过重量级 2D 解码器
+    let strip_formats = oned_barcode_formats();
+    let strip_height = (work_height / 6).max(1);
+    let mut y = 0u32;
+    while y + strip_height <= work_height {
+        let strip = work_img.crop(0, y, work_width, strip_height);
+        jobs.push(DecodeJob {
+            desc: format!("在水平条带(y={}, h={})中成功解码", y, strip_height),
+            image: strip,
+            formats: Some(strip_formats.clone()),
+        });
+        y += strip_height / 2; // 50% 重叠滑动
+    }
+
+    if let Some(outcome) = run_jobs_parallel(jobs) {
+        log_info(&format!("并行级联耗时 {} ms", t_cascade.elapsed().as_millis()));
+        return Some(outcome);
+    }
+
+    // 最后兜底：在全尺寸原图上做一次高强度解码
+    // （针对工作副本中条码过细、缩小后丢失细节的情况）
+    if downscaled {
+        log_warning("并行级联未能解码，尝试全尺寸原图高强度解码");
+        if let Some(result) = decode_barcode_image_with(img, None, true) {
+            return Some(("在全尺寸原图上高强度解码成功".to_string(), result));
+        }
+    }
+
+    None
+}
+
+/// 级联工作图的长边上限
+const CASCADE_MAX_DIM: u32 = 1600;
+
+/// 计算 JPEG 采样解码所需的缩放因子（1/1 ~ 1/8，分母为 2 的幂）
+/// 采样解码在 DCT 域直接输出缩小后的图像，跳过全尺寸解压 + 独立缩放两步
+/// 纯函数便于单元测试
+fn jpeg_sampling_scale(width: u32, height: u32) -> u32 {
+    let max_dim = width.max(height);
+    if max_dim <= CASCADE_MAX_DIM {
+        return 1;
+    }
+    // 取 2 的幂分母，使缩放后长边仍 ≥ CASCADE_MAX_DIM（宁可偏大不偏小，保证条码细节）
+    let mut scale = 1u32;
+    while max_dim / (scale * 2) >= CASCADE_MAX_DIM && scale < 8 {
+        scale *= 2;
+    }
+    scale
+}
+
+/// 加载条码图片，对超大 JPEG 使用采样解码提速
+/// 手机照片常有数千万像素，全尺寸解压再缩放很慢；这里在读文件时
+/// 就按 1/2、1/4 等比例缩小输出。PNG/BMP 等格式没有采样能力，走常规路径。
+fn load_barcode_image(path: &PathBuf) -> Result<DynamicImage, image::ImageError> {
+    // 1. 一次读入内存：采样解码需要先探查尺寸，且字节缓冲可复用
+    let mut buffer = Vec::new();
+    std::fs::File::open(path)
+        .map_err(image::ImageError::IoError)?
+        .read_to_end(&mut buffer)
+        .map_err(image::ImageError::IoError)?;
+
+    // 2. 仅对超大 JPEG 启用采样解码（ImageError 未实现 PartialEq，用 matches! 判断格式）
+    if matches!(image::guess_format(&buffer), Ok(ImageFormat::Jpeg)) {
+        // 同一个解码器先读原始尺寸（仅解析头部），需要时再就地缩小，避免重复建解码器
+        let mut decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&buffer))?;
+        let (w, h) = decoder.dimensions();
+        let scale = jpeg_sampling_scale(w, h);
+        if scale > 1 {
+            // scale() 会自动选用 ≥ 目标尺寸的最小 2 的幂因子，返回缩放后的尺寸
+            let (sw, sh) = decoder.scale((CASCADE_MAX_DIM + 1) as u16, (CASCADE_MAX_DIM + 1) as u16)?;
+            let (sw, sh) = (sw as u32, sh as u32);
+            // 根据解码器自报的色彩类型确定每像素字节数（JPEG 常为彩色 RGB8 或灰度 L8）
+            let bpp = match decoder.color_type() {
+                image::ColorType::L8 => 1usize,
+                image::ColorType::Rgb8 => 3usize,
+                // 其他罕见色彩类型退回全尺寸常规解码，避免手工构造出错
+                _ => 0usize,
+            };
+            if bpp > 0 {
+                let mut data = vec![0u8; (sw as usize) * (sh as usize) * bpp];
+                decoder.read_image(&mut data)?;
+                let img = match bpp {
+                    1 => DynamicImage::ImageLuma8(
+                        ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(sw, sh, data)
+                            .expect("采样灰度数据长度应与图像尺寸一致")),
+                    _ => DynamicImage::ImageRgb8(
+                        ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(sw, sh, data)
+                            .expect("采样彩色数据长度应与图像尺寸一致")),
+                };
+                log_info(&format!("JPEG 采样解码 1/{}（DCT 域直接缩小）", scale));
+                return Ok(img);
+            }
+        }
+    }
+
+    // 3. 常规路径：全尺寸解码（PNG/BMP 等非超大 JPEG）
+    let img = image::io::Reader::new(Cursor::new(&buffer))
+        .with_guessed_format()?
+        .decode()?;
+    Ok(img)
+}
+
 /// 解码指定图片路径中的条码（支持二维码和一维条形码）
-/// 采用多种预处理方法和裁剪策略提高识别率
+/// 先走速度优先的快速通道，失败后再进入完整的预处理与扫描级联
 fn decode_image(image_path: &PathBuf) {
     log_info(&format!("开始解码: {}", image_path.display()));
 
-    let mut img = match image::open(image_path) {
+    let start = Instant::now();
+
+    let mut img = match load_barcode_image(image_path) {
         Ok(img) => img,
         Err(e) => {
             log_error(&format!("无法打开文件: {}", e));
             return;
         }
     };
+    log_info(&format!(
+        "图像读取完成: {}x{} px，耗时 {} ms",
+        img.width(),
+        img.height(),
+        start.elapsed().as_millis()
+    ));
 
-    // 尝试所有预处理后的图像（列表首项即为"原始图像"，无需额外重复解码）
-    let processed_images = preprocess_image(&img);
-
-    for (name, processed_img) in &processed_images {
-        if let Some(result) = decode_barcode_image(processed_img) {
-            log_info(&format!("使用 {} 成功解码", name));
+    match try_decode_image(&mut img) {
+        Some((how, result)) => {
+            log_info(&how);
             log_info(&format!("条码格式: {}", format_display_name(&result.format)));
             log_info(&format!("解码内容: {}", result.text));
-            return;
+            log_info(&format!("解码耗时: {} ms", start.elapsed().as_millis()));
+        }
+        None => {
+            log_error("经过所有尝试后仍然无法解码");
+            log_info("建议：确保条码清晰完整，光照均匀，或尝试使用专业扫码应用");
         }
     }
-
-    // 预处理失败，尝试裁剪图像四角
-    log_warning("标准方法未能解码，尝试额外的裁剪处理方法");
-
-    let width = img.width();
-    let height = img.height();
-
-    let crops = [
-        ("左上角", (0, 0, width / 2, height / 2)),
-        ("右上角", (width / 2, 0, width, height / 2)),
-        ("左下角", (0, height / 2, width / 2, height)),
-        ("右下角", (width / 2, height / 2, width, height)),
-    ];
-
-    for (name, (x, y, x2, y2)) in &crops {
-        let cropped = img.crop(*x, *y, x2 - x, y2 - y);
-        if let Some(result) = decode_barcode_image(&cropped) {
-            log_info(&format!("在裁剪区域 {} 中成功解码", name));
-            log_info(&format!("条码格式: {}", format_display_name(&result.format)));
-            log_info(&format!("解码内容: {}", result.text));
-            return;
-        }
-    }
-
-    // 水平条带扫描（针对一维条形码常出现在图像中某个水平条带的情况）
-    log_warning("裁剪方法未能解码，尝试水平条带扫描");
-
-    let strip_height = (height / 6).max(1);
-    let mut y = 0u32;
-    while y + strip_height <= height {
-        let strip = img.crop(0, y, width, strip_height);
-        if let Some(result) = decode_barcode_image(&strip) {
-            log_info(&format!("在水平条带(y={}, h={})中成功解码", y, strip_height));
-            log_info(&format!("条码格式: {}", format_display_name(&result.format)));
-            log_info(&format!("解码内容: {}", result.text));
-            return;
-        }
-        y += strip_height / 2; // 50% 重叠滑动
-    }
-
-    log_error("经过所有尝试后仍然无法解码");
-    log_info("建议：确保条码清晰完整，光照均匀，或尝试使用专业扫码应用");
 }
 
 /// 将 BarcodeFormat 枚举转为易读的中文显示名称
@@ -457,12 +711,33 @@ fn main() {
         std::process::exit(1);
     }
 
-    // 依次处理每个路径
-    for (i, path_str) in paths.iter().enumerate() {
-        if paths.len() > 1 {
-            log_info(&format!("正在处理第 {} 个: {}", i + 1, path_str));
+    if paths.len() == 1 {
+        // 单图（最常见）直接处理，日志即时打印，无额外开销
+        process_input(paths[0]);
+    } else {
+        // 多图并行解码：每张图片在自己的线程里跑完整流程并捕获日志，
+        // 主线程按输入顺序统一打印，既提速又保证输出不交错
+        let captured: Vec<Vec<CapturedLog>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .map(|(i, path_str)| {
+                    let path_owned = (*path_str).to_string();
+                    let index = i + 1;
+                    scope.spawn(move || {
+                        let (_, logs) = capture_logs(|| {
+                            log_info(&format!("正在处理第 {} 个: {}", index, path_owned));
+                            process_input(&path_owned);
+                        });
+                        logs
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        for logs in captured {
+            flush_captured_logs(logs);
         }
-        process_input(path_str);
     }
 
     keep_console_open();
@@ -493,6 +768,40 @@ mod tests {
         // 前 4 位与中间日期位都应为数字
         assert!(b[..4].iter().all(|c| c.is_ascii_digit()));
         assert!(b[11..13].iter().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_capture_logs_collects_instead_of_printing() {
+        // 捕获模式下：日志不直接输出，而是按顺序收集，且保留级别与目标流
+        let (ret, logs) = capture_logs(|| {
+            log_info("hello info");
+            log_warning("a warning");
+            log_error("an error");
+            42
+        });
+        assert_eq!(ret, 42);
+        assert_eq!(logs.len(), 3);
+        assert!(logs[0].line.contains("INFO"));
+        assert!(!logs[0].to_stderr);
+        assert!(logs[1].line.contains("WARNING"));
+        assert!(!logs[1].to_stderr);
+        assert!(logs[2].line.contains("ERROR"));
+        assert!(logs[2].to_stderr, "ERROR 应标记为输出到标准错误流");
+    }
+
+    #[test]
+    fn test_capture_logs_nested_and_restores_state() {
+        // 嵌套捕获：内层结束后外层不应受影响；整体结束后线程回到直接打印模式
+        let (outer_len, _) = capture_logs(|| {
+            log_info("outer-1");
+            let inner_logs = capture_logs(|| log_info("inner")).1;
+            log_info("outer-2");
+            inner_logs.len()
+        });
+        assert_eq!(outer_len, 1, "内层捕获不应污染外层缓冲");
+        // 退出捕获模式后再调用日志应直接打印（不 panic、不残留缓冲）
+        let (_, logs) = capture_logs(|| log_info("fresh"));
+        assert_eq!(logs.len(), 1);
     }
 
     #[test]
@@ -535,17 +844,18 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_image_returns_ten_variants() {
-        // 包含：原始、灰度、高对比度、二值化(128)、二值化(64)、二值化(192)、高斯模糊+二值化、锐化、反色、放大
+    fn test_preprocess_image_returns_nine_variants() {
+        // 包含：原始、高对比度、二值化(128)、二值化(64)、二值化(192)、高斯模糊+二值化、锐化、反色、放大（小图）
+        // 注意：灰度变体已移除（解码器内部自行转灰度，属于重复工作）
         let img = solid_image(8, 8, [128, 128, 128]);
         let processed = preprocess_image(&img);
-        assert_eq!(processed.len(), 10);
+        assert_eq!(processed.len(), 9);
 
         let names: Vec<&str> = processed.iter().map(|(n, _)| n.as_str()).collect();
         // 验证首项为原始图像，避免回归删除之前重复解码时丢失基础入口
         assert_eq!(names[0], "原始图像");
+        assert!(!names.contains(&"灰度图像"), "重复的灰度变体应已移除");
         for expected in [
-            "灰度图像",
             "高对比度图像",
             "二值化图像",
             "二值化图像(阈值64)",
@@ -557,6 +867,16 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "缺少预处理变体: {}", expected);
         }
+    }
+
+    #[test]
+    fn test_preprocess_image_skips_upscale_for_large_images() {
+        // 长边超过 900px 的大图不应再生成放大变体（耗时且无收益）
+        let img = solid_image(1000, 950, [128, 128, 128]);
+        let processed = preprocess_image(&img);
+        let names: Vec<&str> = processed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"放大图像"), "大图不应包含放大变体");
+        assert_eq!(processed.len(), 8);
     }
 
     #[test]
@@ -576,7 +896,96 @@ mod tests {
     fn test_decode_barcode_image_blank_returns_none() {
         // 全白图不会包含任何条码
         let img = solid_image(32, 32, [255, 255, 255]);
-        assert!(decode_barcode_image(&img).is_none());
+        assert!(decode_barcode_image_with(&img, None, true).is_none());
+    }
+
+    #[test]
+    fn test_run_jobs_parallel_empty_jobs_returns_none() {
+        assert!(run_jobs_parallel(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn test_run_jobs_parallel_blank_images_return_none() {
+        // 混合全格式与一维格式任务，空白图均无法解码，不应 panic 或死锁
+        let jobs = vec![
+            DecodeJob {
+                desc: "a".to_string(),
+                image: solid_image(32, 32, [255, 255, 255]),
+                formats: None,
+            },
+            DecodeJob {
+                desc: "b".to_string(),
+                image: solid_image(16, 16, [0, 0, 0]),
+                formats: Some(oned_barcode_formats()),
+            },
+        ];
+        assert!(run_jobs_parallel(jobs).is_none());
+    }
+
+    #[test]
+    fn test_oned_barcode_formats_contents() {
+        let formats = oned_barcode_formats();
+        // 应包含常见一维格式
+        for expected in [
+            BarcodeFormat::EAN_13,
+            BarcodeFormat::UPC_A,
+            BarcodeFormat::CODE_128,
+            BarcodeFormat::PDF_417,
+        ] {
+            assert!(formats.contains(&expected), "缺少一维格式: {}", expected);
+        }
+        // 不应包含重量级 2D 格式（条带扫描提速的关键）
+        for excluded in [
+            BarcodeFormat::QR_CODE,
+            BarcodeFormat::AZTEC,
+            BarcodeFormat::DATA_MATRIX,
+        ] {
+            assert!(!formats.contains(&excluded), "不应包含 2D 格式: {}", excluded);
+        }
+    }
+
+    #[test]
+    fn test_decode_barcode_image_with_restricted_formats() {
+        // 限制格式集后对空白图同样返回 None，不应 panic
+        let img = solid_image(32, 32, [255, 255, 255]);
+        let formats = oned_barcode_formats();
+        assert!(decode_barcode_image_with(&img, Some(&formats), false).is_none());
+        assert!(decode_barcode_image_with(&img, None, true).is_none());
+    }
+
+    #[test]
+    fn test_jpeg_sampling_scale_thresholds() {
+        // 小图不缩放
+        assert_eq!(jpeg_sampling_scale(100, 100), 1);
+        assert_eq!(jpeg_sampling_scale(1600, 1200), 1);
+        assert_eq!(jpeg_sampling_scale(1601, 100), 2);
+        // 典型手机照片：2412px → 1/2 后 1206px
+        assert_eq!(jpeg_sampling_scale(1080, 2412), 2);
+        // 4000px → 1/4 后 1000px（1/8 会低于 1600 下限）
+        assert_eq!(jpeg_sampling_scale(3000, 4000), 4);
+        // 8000px → 1/8 后 1000px（分母封顶 8）
+        assert_eq!(jpeg_sampling_scale(8000, 6000), 8);
+        assert_eq!(jpeg_sampling_scale(20000, 10000), 8);
+    }
+
+    #[test]
+    fn test_load_barcode_image_missing_file_returns_io_error() {
+        // 不存在的文件应返回 IO 错误，不应 panic
+        let result = load_barcode_image(&PathBuf::from("Z:\\not_exist_for_test.jpg"));
+        assert!(matches!(result, Err(image::ImageError::IoError(_))));
+    }
+
+    #[test]
+    fn test_load_barcode_image_reads_small_jpeg_from_tempfile() {
+        // 小尺寸 JPEG 不会触发采样（scale==1），应走常规解码路径并原尺寸返回
+        let img = solid_image(64, 48, [200, 100, 50]);
+        let mut tmp = NamedTempFile::new().expect("创建临时文件失败");
+        img.save_with_format(&mut tmp, ImageFormat::Jpeg)
+            .expect("写入临时 JPEG 失败");
+        let path = tmp.path().to_path_buf();
+        let loaded = load_barcode_image(&path).expect("应能加载临时 JPEG");
+        assert_eq!(loaded.width(), 64);
+        assert_eq!(loaded.height(), 48);
     }
 
     #[test]
