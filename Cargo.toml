@@ -11,3 +11,15 @@ reqwest = { version = "0.12", features = ["blocking"] }
 regex = "1.11"
 tempfile = "3.14"
 colored = "2.1"
+
+# dev 构建也开优化：rxing 是纯计算库，debug（opt-level=0）下解码慢 10~30 倍，
+# 导致 IDE 里 cargo run 体验很差；开启后仅编译稍慢，运行接近 release
+[profile.dev]
+opt-level = 3
+
+# release 构建优化：条码解码是纯计算密集型任务，LTO + 单 codegen unit
+# 能进一步提速约 10%~25%，对 rxing 这种大型库效果尤其明显
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
