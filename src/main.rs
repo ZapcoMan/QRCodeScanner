@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
 use chrono::Local;
 use regex::Regex;
@@ -290,8 +291,90 @@ fn process_input(input_path: &str) {
     }
 }
 
+/// 判断当前控制台是否只由本进程独占
+/// 双击启动时 Windows 会为进程新建控制台，列表里只有我们自己；
+/// 从已有终端启动时，宿主 shell 也在同一控制台内，数量大于 1
+#[cfg(windows)]
+fn owns_console_alone() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleProcessList(process_list: *mut u32, max_count: u32) -> u32;
+    }
+
+    let mut pids = [0u32; 4];
+    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    count == 1
+}
+
+/// 在当前控制台内另起一个交互式 PowerShell，使本进程退出后窗口仍然保留
+/// CREATE_NEW_PROCESS_GROUP 让新 shell 不响应本进程收到的 Ctrl+C 广播
+#[cfg(windows)]
+fn spawn_persistent_shell(program: &std::ffi::OsStr) -> io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0200;
+
+    std::process::Command::new(program)
+        .arg("-NoExit")
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+}
+
+/// 选择可用的 PowerShell：优先 PowerShell 7（pwsh），回退系统自带的 Windows PowerShell 5.1
+#[cfg(windows)]
+fn keep_console_open() {
+    if !owns_console_alone() {
+        return;
+    }
+
+    // pwsh 没有固定安装路径，只能靠 PATH 查找；起不来就说明未安装，直接回退
+    if spawn_persistent_shell(OsStr::new("pwsh")).is_ok() {
+        return;
+    }
+
+    // 5.1 用绝对路径，避免用户改过 PATH 后找不到
+    let legacy = std::env::var("SystemRoot")
+        .map(|root| {
+            PathBuf::from(root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .unwrap_or_else(|_| PathBuf::from("powershell.exe"));
+
+    let _ = spawn_persistent_shell(legacy.as_os_str());
+}
+
+/// 控制台事件回调：先留下可用的 shell，再交回系统默认终止流程
+#[cfg(windows)]
+unsafe extern "system" fn console_event_handler(_event_type: u32) -> i32 {
+    keep_console_open();
+    0
+}
+
+/// 注册 Ctrl+C / 关闭事件回调
+#[cfg(windows)]
+fn install_console_guard() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+    unsafe { SetConsoleCtrlHandler(Some(console_event_handler), 1) };
+}
+
+#[cfg(not(windows))]
+fn install_console_guard() {}
+
+#[cfg(not(windows))]
+fn keep_console_open() {}
+
 /// 主函数：程序入口
 fn main() {
+    install_console_guard();
+
     print!("请输入二维码图片的路径或 URL（多个用逗号分隔）: ");
     io::stdout().flush().expect("无法刷新输出缓冲区");
     
@@ -302,6 +385,7 @@ fn main() {
 
     if input.is_empty() {
         log_error("未提供输入路径");
+        keep_console_open();
         std::process::exit(1);
     }
 
@@ -310,6 +394,7 @@ fn main() {
 
     if paths.is_empty() {
         log_error("未提供有效的路径");
+        keep_console_open();
         std::process::exit(1);
     }
 
@@ -320,6 +405,8 @@ fn main() {
         }
         process_input(path_str);
     }
+
+    keep_console_open();
 }
 
 #[cfg(test)]
