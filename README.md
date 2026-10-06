@@ -2,7 +2,7 @@
 
 ![Rust](https://img.shields.io/badge/Rust-Edition%202024-orange)
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue)
-![Version](https://img.shields.io/badge/Version-v1.1.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-v1.2.0-brightgreen)
 ![Tests](https://img.shields.io/badge/Tests-10%20passed-success)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -20,7 +20,7 @@ Barcode Scanner 是一款专注于识别率的命令行条码解码工具，支�
 
 - 📊 **多格式支持**：QR Code、EAN-13/8、UPC-A/E、Code 128/39/93、ITF、Data Matrix、Aztec、PDF417 等 20+ 种条码格式
 - 🖥️ **双通道输入**：支持本地文件路径与 http / https URL，两者可混合批量使用
-- 📦 **批量处理**：英文逗号分隔多个输入，一次运行解码多张图片
+- 📦 **批量并行处理**：英文逗号分隔多个输入，多张图片跨线程并行解码，输出仍按输入顺序无交错
 - 🔧 **10 级图像预处理**：原始 → 灰度 → 高对比度 → 多阈值二值化 → 高斯模糊 → 锐化 → 反色 → 2× 放大，逐级降级重试
 - ✂️ **四角裁剪 + 水平条带扫描**：标准预处理失败后，自动裁剪四角并滑动水平条带重试
 - 🏷️ **格式识别输出**：解码成功时显示条码类型（如 “EAN-13 商品条码”、“Code 128 条码”）
