@@ -1,7 +1,5 @@
 # QR Code Scanner
 
-<div align="center">
-
 ![Rust](https://img.shields.io/badge/Rust-Edition%202024-orange)
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue)
 ![Version](https://img.shields.io/badge/Version-v1.0.0-brightgreen)
@@ -11,8 +9,6 @@
 **基于 Rust 的高性能命令行二维码解码工具，内置 10 级图像预处理与 4 路裁剪重试**
 
 [快速开始](#-快速开始) • [使用说明](#-使用说明) • [技术细节](#-技术细节) • [测试说明](#-测试说明)
-
-</div>
 
 ---
 
@@ -33,16 +29,16 @@ QR Code Scanner 是一款专注于识别率的命令行二维码解码工具，�
 
 ### 🛠 技术栈
 
-| 分类 | 技术 |
-|------|------|
-| **语言** | Rust（Edition 2024） |
-| **解码核心** | bardecoder 0.4 |
-| **图像处理** | image 0.24（PNG / JPG / GIF / BMP / WEBP） |
-| **网络请求** | reqwest 0.12（blocking 模式，30 s 超时） |
-| **URL 校验** | regex 1.11 |
-| **临时文件** | tempfile 3.14 |
-| **日志时间戳** | chrono 0.4 |
-| **终端着色** | colored 2.1 |
+| 分类           | 技术                                                           |
+|----------------|----------------------------------------------------------------|
+| **语言**       | Rust（Edition 2024）                                           |
+| **解码核心**   | bardecoder 0.4                                                 |
+| **图像处理**   | image 0.24（PNG / JPG / GIF / BMP / WEBP）                     |
+| **网络请求**   | reqwest 0.12（blocking 模式，30 s 超时）                       |
+| **URL 校验**   | regex 1.11                                                     |
+| **临时文件**   | tempfile 3.14                                                  |
+| **日志时间戳** | chrono 0.4                                                     |
+| **终端着色**   | colored 2.1                                                    |
 | **控制台守卫** | Win32 API（`GetConsoleProcessList` / `SetConsoleCtrlHandler`） |
 
 ---
@@ -88,13 +84,13 @@ cargo run
 
 ### 输入格式
 
-| 场景 | 输入示例 |
-|------|----------|
-| 单个本地图片 | `C:\path\to\qrcode.png` |
-| 多个本地图片 | `C:\path\to\qr1.png, C:\path\to\qr2.jpg` |
-| 网络图片 | `https://example.com/qrcode.png` |
+| 场景                 | 输入示例                                                      |
+|----------------------|---------------------------------------------------------------|
+| 单个本地图片         | `C:\path\to\qrcode.png`                                       |
+| 多个本地图片         | `C:\path\to\qr1.png, C:\path\to\qr2.jpg`                      |
+| 网络图片             | `https://example.com/qrcode.png`                              |
 | 带签名参数的 CDN URL | `https://s3.amazonaws.com/bucket/key.png?X-Amz-Signature=abc` |
-| 本地与网络混合 | `C:\path\to\local.png, https://example.com/remote.jpg` |
+| 本地与网络混合       | `C:\path\to\local.png, https://example.com/remote.jpg`        |
 
 ### 支持的图片类型
 
@@ -155,28 +151,28 @@ main()
 
 `preprocess_image()` 按以下顺序生成 **10 个候选图像**，逐一送入解码器，命中即止：
 
-| # | 名称 | 处理方法 |
-|---|------|----------|
-| 1 | 原始图像 | 直接 clone 输入图像 |
-| 2 | 灰度图像 | `to_luma8()` |
-| 3 | 高对比度图像 | 灰度 + `contrast(2.0)` |
-| 4 | 二值化图像（阈值 128） | 高对比度 + 阈值二值化 |
-| 5 | 二值化图像（阈值 64） | 高对比度 + 低阈值二值化 |
-| 6 | 二值化图像（阈值 192） | 高对比度 + 高阈值二值化 |
-| 7 | 高斯模糊 + 二值化 | 灰度 `blur(1.0)` + 阈值二值化 |
-| 8 | 锐化图像 | RGBA `unsharpen(1.0, 0)` |
-| 9 | 颜色反转图像 | 灰度每像素 `255 - v` |
-| 10 | 放大图像 | 2× Lanczos3 放大 |
+| #  | 名称                   | 处理方法                      |
+|----|------------------------|-------------------------------|
+| 1  | 原始图像               | 直接 clone 输入图像           |
+| 2  | 灰度图像               | `to_luma8()`                  |
+| 3  | 高对比度图像           | 灰度 + `contrast(2.0)`        |
+| 4  | 二值化图像（阈值 128） | 高对比度 + 阈值二值化         |
+| 5  | 二值化图像（阈值 64）  | 高对比度 + 低阈值二值化       |
+| 6  | 二值化图像（阈值 192） | 高对比度 + 高阈值二值化       |
+| 7  | 高斯模糊 + 二值化      | 灰度 `blur(1.0)` + 阈值二值化 |
+| 8  | 锐化图像               | RGBA `unsharpen(1.0, 0)`      |
+| 9  | 颜色反转图像           | 灰度每像素 `255 - v`          |
+| 10 | 放大图像               | 2× Lanczos3 放大              |
 
 ### 四角裁剪策略
 
 若所有预处理变体均失败，输出 WARNING 日志后对图像四角各裁剪 1/4 重试：
 
-| 区域 | 裁剪坐标 (x, y, x2, y2) |
-|------|------------------------|
-| 左上角 | (0, 0, width/2, height/2) |
-| 右上角 | (width/2, 0, width, height/2) |
-| 左下角 | (0, height/2, width/2, height) |
+| 区域   | 裁剪坐标 (x, y, x2, y2)            |
+|--------|------------------------------------|
+| 左上角 | (0, 0, width/2, height/2)          |
+| 右上角 | (width/2, 0, width, height/2)      |
+| 左下角 | (0, height/2, width/2, height)     |
 | 右下角 | (width/2, height/2, width, height) |
 
 ### URL 识别规则
@@ -187,14 +183,14 @@ main()
 (?i)^https?://\S+\.(png|jpg|jpeg|gif|bmp|webp)(\?\S*)?(#\S*)?$
 ```
 
-| 场景 | 示例 | 是否匹配 |
-|------|------|---------|
-| 普通图片 URL | `https://example.com/qr.png` | ✅ |
-| 大写扩展名 | `https://example.com/QR.PNG` | ✅ |
-| 带端口 | `https://example.com:8080/qr.png` | ✅ |
-| 带查询参数 | `https://example.com/qr.png?token=abc` | ✅ |
-| 多级路径 | `https://cdn.example.com/a/b/c.png` | ✅ |
-| 本地路径 | `C:\path\to\qr.png` | ❌ |
+| 场景         | 示例                                   | 是否匹配 |
+|--------------|----------------------------------------|----------|
+| 普通图片 URL | `https://example.com/qr.png`           | ✅       |
+| 大写扩展名   | `https://example.com/QR.PNG`           | ✅       |
+| 带端口       | `https://example.com:8080/qr.png`      | ✅       |
+| 带查询参数   | `https://example.com/qr.png?token=abc` | ✅       |
+| 多级路径     | `https://cdn.example.com/a/b/c.png`    | ✅       |
+| 本地路径     | `C:\path\to\qr.png`                    | ❌       |
 
 ### 日志格式
 
@@ -202,22 +198,22 @@ main()
 {YYYY-MM-DD HH:MM:SS} - {级别} - {消息}
 ```
 
-| 级别 | 颜色 | 输出流 |
-|------|------|--------|
-| INFO | 🔵 蓝色 | stdout |
+| 级别    | 颜色    | 输出流 |
+|---------|---------|--------|
+| INFO    | 🔵 蓝色 | stdout |
 | WARNING | 🟡 黄色 | stdout |
-| ERROR | 🔴 红色 | stderr |
+| ERROR   | 🔴 红色 | stderr |
 
 ### 控制台窗口保留机制
 
 双击 exe 启动时，`keep_console_open()` 通过 Win32 `GetConsoleProcessList` 检测是否独占控制台（进程数为 1），若是则 spawn 一个带 `-NoExit` 参数的 PowerShell 交互式会话接管窗口。
 
-| 启动方式 | 是否派生 shell |
-|----------|--------------|
-| 双击 exe（新建控制台） | ✅ 是 |
-| 在已有终端中运行 | ❌ 否 |
-| `cargo run` | ❌ 否 |
-| Git Bash 直接运行 | ❌ 否 |
+| 启动方式               | 是否派生 shell |
+|------------------------|----------------|
+| 双击 exe（新建控制台） | ✅ 是          |
+| 在已有终端中运行       | ❌ 否          |
+| `cargo run`            | ❌ 否          |
+| Git Bash 直接运行      | ❌ 否          |
 
 优先使用 PATH 中的 `pwsh`（PowerShell 7），失败则回退至 Windows PowerShell 5.1。
 
@@ -227,16 +223,16 @@ main()
 
 项目包含 **8 个不依赖网络的单元测试**，覆盖 URL 判定、图像预处理与解码器核心逻辑。
 
-| 测试函数 | 验证内容 |
-|----------|----------|
-| `test_get_timestamp_format` | 时间戳格式与分隔符位置 |
-| `test_is_url_accepts_common_image_urls` | 6 种常见图片扩展名的正例 |
-| `test_is_url_supports_query_fragment_port_and_case` | 端口 / 查询参数 / fragment / 大写扩展名 |
-| `test_is_url_rejects_invalid_inputs` | 9 个反例（本地路径、错误协议、无扩展名等） |
-| `test_preprocess_image_returns_ten_variants` | 预处理列表长度为 10，首项为"原始图像" |
-| `test_preprocess_image_upscaled_doubles_size` | 16×16 → 32×32 放大语义 |
-| `test_decode_qr_image_blank_returns_none` | 空白图应返回 None |
-| `test_download_image_rejects_invalid_url_without_network` | 非法 URL 不发网络请求即返回 None |
+| 测试函数                                                  | 验证内容                                   |
+|-----------------------------------------------------------|--------------------------------------------|
+| `test_get_timestamp_format`                               | 时间戳格式与分隔符位置                     |
+| `test_is_url_accepts_common_image_urls`                   | 6 种常见图片扩展名的正例                   |
+| `test_is_url_supports_query_fragment_port_and_case`       | 端口 / 查询参数 / fragment / 大写扩展名    |
+| `test_is_url_rejects_invalid_inputs`                      | 9 个反例（本地路径、错误协议、无扩展名等） |
+| `test_preprocess_image_returns_ten_variants`              | 预处理列表长度为 10，首项为"原始图像"      |
+| `test_preprocess_image_upscaled_doubles_size`             | 16×16 → 32×32 放大语义                     |
+| `test_decode_qr_image_blank_returns_none`                 | 空白图应返回 None                          |
+| `test_download_image_rejects_invalid_url_without_network` | 非法 URL 不发网络请求即返回 None           |
 
 **快速运行：**
 
