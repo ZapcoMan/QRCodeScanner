@@ -5,7 +5,6 @@ use std::io::{self, BufRead, Cursor, Read, Write};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 use chrono::Local;
 use regex::Regex;
 use tempfile::NamedTempFile;
@@ -364,33 +363,20 @@ fn try_decode_image(img: &mut DynamicImage) -> Option<(String, DecodeResult)> {
     // 缩小后条码模块宽度通常仍≥ 3px，不影响解码
     // （若加载阶段已采样解码到 ≈CASCADE_MAX_DIM，此处会自然跳过缩放）
     let downscaled = width.max(height) > CASCADE_MAX_DIM;
-    let t_resize = Instant::now();
     let mut work_img = if downscaled {
         img.resize(CASCADE_MAX_DIM, CASCADE_MAX_DIM, imageops::FilterType::Triangle)
     } else {
         img.clone()
     };
-    if downscaled {
-        log_info(&format!(
-            "工作图缩放至 {}x{}，耗时 {} ms",
-            work_img.width(),
-            work_img.height(),
-            t_resize.elapsed().as_millis()
-        ));
-    }
 
     // 快速通道：工作图低强度一次解码（TryHarder 关闭），清晰图片通常在此即命中
-    let t_fast = Instant::now();
     if let Some(result) = decode_barcode_image_with(&work_img, None, false) {
-        log_info(&format!("快速通道解码耗时 {} ms", t_fast.elapsed().as_millis()));
         return Some(("快速通道解码成功（工作图像）".to_string(), result));
     }
-    log_info(&format!("快速通道未命中，耗时 {} ms", t_fast.elapsed().as_millis()));
 
     log_warning("快速通道未能解码，进入并行级联尝试");
 
     // 收集全部候选任务：预处理变体 + 角部裁剪 + 水平条带，一次性并行执行
-    let t_cascade = Instant::now();
     let (work_width, work_height) = (work_img.width(), work_img.height());
     let mut jobs: Vec<DecodeJob> = Vec::new();
 
@@ -433,7 +419,6 @@ fn try_decode_image(img: &mut DynamicImage) -> Option<(String, DecodeResult)> {
     }
 
     if let Some(outcome) = run_jobs_parallel(jobs) {
-        log_info(&format!("并行级联耗时 {} ms", t_cascade.elapsed().as_millis()));
         return Some(outcome);
     }
 
@@ -507,7 +492,6 @@ fn load_barcode_image(path: &PathBuf) -> Result<DynamicImage, image::ImageError>
                         ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(sw, sh, data)
                             .expect("采样彩色数据长度应与图像尺寸一致")),
                 };
-                log_info(&format!("JPEG 采样解码 1/{}（DCT 域直接缩小）", scale));
                 return Ok(img);
             }
         }
@@ -525,8 +509,6 @@ fn load_barcode_image(path: &PathBuf) -> Result<DynamicImage, image::ImageError>
 fn decode_image(image_path: &PathBuf) {
     log_info(&format!("开始解码: {}", image_path.display()));
 
-    let start = Instant::now();
-
     let mut img = match load_barcode_image(image_path) {
         Ok(img) => img,
         Err(e) => {
@@ -534,19 +516,12 @@ fn decode_image(image_path: &PathBuf) {
             return;
         }
     };
-    log_info(&format!(
-        "图像读取完成: {}x{} px，耗时 {} ms",
-        img.width(),
-        img.height(),
-        start.elapsed().as_millis()
-    ));
 
     match try_decode_image(&mut img) {
         Some((how, result)) => {
             log_info(&how);
             log_info(&format!("条码格式: {}", format_display_name(&result.format)));
             log_info(&format!("解码内容: {}", result.text));
-            log_info(&format!("解码耗时: {} ms", start.elapsed().as_millis()));
         }
         None => {
             log_error("经过所有尝试后仍然无法解码");
