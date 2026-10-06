@@ -1,10 +1,10 @@
 [package]
 name = "QRCodeScanner"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
-bardecoder = "0.4.2"
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "oned", "qrcode", "aztec", "datamatrix", "pdf417"] }
 image = "0.24.9"
 chrono = "0.4.38"
 reqwest = { version = "0.12", features = ["blocking"] }

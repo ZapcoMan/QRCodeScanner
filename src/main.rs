@@ -7,6 +7,8 @@ use tempfile::NamedTempFile;
 use image::{DynamicImage, ImageBuffer, Luma};
 use image::imageops;
 use colored::Colorize;
+use rxing::helpers::detect_in_luma_slice;
+use rxing::BarcodeFormat;
 
 /// 获取当前时间戳，格式为 "年-月-日 时:分:秒"
 fn get_timestamp() -> String {
@@ -100,7 +102,6 @@ fn download_image(url: &str) -> Option<PathBuf> {
             return None;
         }
     };
-    use std::io::Write;
     if let Err(e) = temp_file.write_all(&bytes) {
         log_error(&format!("写入临时文件失败: {}", e));
         return None;
@@ -203,26 +204,39 @@ fn preprocess_image(img: &DynamicImage) -> Vec<(String, DynamicImage)> {
     images
 }
 
-/// 尝试解码单个图像中的二维码
-/// 成功时返回二维码内容，失败时返回 None
-fn decode_qr_image(img: &DynamicImage) -> Option<String> {
-    let results = bardecoder::default_decoder().decode(img);
-    
-    for result in results {
-        if let Ok(text) = result {
+/// 解码结果结构体，包含文本内容和条码格式
+struct DecodeResult {
+    text: String,
+    format: BarcodeFormat,
+}
+
+/// 将 DynamicImage 转换为灰度数据并尝试解码（二维码 + 条形码）
+/// 成功时返回解码结果（含格式信息），失败时返回 None
+fn decode_barcode_image(img: &DynamicImage) -> Option<DecodeResult> {
+    let luma = img.to_luma8();
+    let (width, height) = (luma.width(), luma.height());
+    let luma_data: &[u8] = luma.as_raw();
+
+    match detect_in_luma_slice(luma_data, width, height, None) {
+        Ok(result) => {
+            let text = result.getText().to_string();
             if !text.is_empty() {
-                return Some(text);
+                return Some(DecodeResult {
+                    text,
+                    format: *result.getBarcodeFormat(),
+                });
             }
         }
+        Err(_) => {}
     }
-    
+
     None
 }
 
-/// 解码指定图片路径中的二维码
+/// 解码指定图片路径中的条码（支持二维码和一维条形码）
 /// 采用多种预处理方法和裁剪策略提高识别率
-fn decode_qrcode(image_path: &PathBuf) {
-    log_info(&format!("开始解码二维码: {}", image_path.display()));
+fn decode_image(image_path: &PathBuf) {
+    log_info(&format!("开始解码: {}", image_path.display()));
 
     let mut img = match image::open(image_path) {
         Ok(img) => img,
@@ -234,21 +248,22 @@ fn decode_qrcode(image_path: &PathBuf) {
 
     // 尝试所有预处理后的图像（列表首项即为"原始图像"，无需额外重复解码）
     let processed_images = preprocess_image(&img);
-    
+
     for (name, processed_img) in &processed_images {
-        if let Some(text) = decode_qr_image(processed_img) {
+        if let Some(result) = decode_barcode_image(processed_img) {
             log_info(&format!("使用 {} 成功解码", name));
-            log_info(&format!("二维码内容: {}", text));
+            log_info(&format!("条码格式: {}", format_display_name(&result.format)));
+            log_info(&format!("解码内容: {}", result.text));
             return;
         }
     }
 
     // 预处理失败，尝试裁剪图像四角
-    log_warning("标准方法未能解码二维码，尝试额外的处理方法");
+    log_warning("标准方法未能解码，尝试额外的裁剪处理方法");
 
     let width = img.width();
     let height = img.height();
-    
+
     let crops = [
         ("左上角", (0, 0, width / 2, height / 2)),
         ("右上角", (width / 2, 0, width, height / 2)),
@@ -258,15 +273,59 @@ fn decode_qrcode(image_path: &PathBuf) {
 
     for (name, (x, y, x2, y2)) in &crops {
         let cropped = img.crop(*x, *y, x2 - x, y2 - y);
-        if let Some(text) = decode_qr_image(&cropped) {
+        if let Some(result) = decode_barcode_image(&cropped) {
             log_info(&format!("在裁剪区域 {} 中成功解码", name));
-            log_info(&format!("二维码内容: {}", text));
+            log_info(&format!("条码格式: {}", format_display_name(&result.format)));
+            log_info(&format!("解码内容: {}", result.text));
             return;
         }
     }
 
-    log_error("经过所有尝试后仍然无法解码二维码");
-    log_info("建议：确保二维码清晰完整，或尝试使用专门的二维码应用扫描");
+    // 水平条带扫描（针对一维条形码常出现在图像中某个水平条带的情况）
+    log_warning("裁剪方法未能解码，尝试水平条带扫描");
+
+    let strip_height = (height / 6).max(1);
+    let mut y = 0u32;
+    while y + strip_height <= height {
+        let strip = img.crop(0, y, width, strip_height);
+        if let Some(result) = decode_barcode_image(&strip) {
+            log_info(&format!("在水平条带(y={}, h={})中成功解码", y, strip_height));
+            log_info(&format!("条码格式: {}", format_display_name(&result.format)));
+            log_info(&format!("解码内容: {}", result.text));
+            return;
+        }
+        y += strip_height / 2; // 50% 重叠滑动
+    }
+
+    log_error("经过所有尝试后仍然无法解码");
+    log_info("建议：确保条码清晰完整，光照均匀，或尝试使用专业扫码应用");
+}
+
+/// 将 BarcodeFormat 枚举转为易读的中文显示名称
+fn format_display_name(fmt: &BarcodeFormat) -> &'static str {
+    match fmt {
+        BarcodeFormat::QR_CODE => "二维码 (QR Code)",
+        BarcodeFormat::MICRO_QR_CODE => "微型二维码 (Micro QR)",
+        BarcodeFormat::RECTANGULAR_MICRO_QR_CODE => "矩形微型二维码 (rMQR)",
+        BarcodeFormat::EAN_13 => "EAN-13 商品条码",
+        BarcodeFormat::EAN_8 => "EAN-8 商品条码",
+        BarcodeFormat::UPC_A => "UPC-A 商品条码",
+        BarcodeFormat::UPC_E => "UPC-E 商品条码",
+        BarcodeFormat::CODE_128 => "Code 128 条码",
+        BarcodeFormat::CODE_39 => "Code 39 条码",
+        BarcodeFormat::CODE_93 => "Code 93 条码",
+        BarcodeFormat::CODABAR => "Codabar 条码",
+        BarcodeFormat::ITF => "ITF (二五码) 条码",
+        BarcodeFormat::DATA_MATRIX => "Data Matrix 码",
+        BarcodeFormat::AZTEC => "Aztec 码",
+        BarcodeFormat::PDF_417 => "PDF417 条码",
+        BarcodeFormat::RSS_14 => "RSS-14 条码",
+        BarcodeFormat::RSS_EXPANDED => "RSS-Expanded 条码",
+        BarcodeFormat::MAXICODE => "MaxiCode 条码",
+        BarcodeFormat::TELEPEN => "Telepen 条码",
+        BarcodeFormat::UPC_EAN_EXTENSION => "UPC/EAN 扩展码",
+        _ => "未知格式",
+    }
 }
 
 /// 处理单个输入路径（本地路径或 URL）
@@ -276,13 +335,13 @@ fn process_input(input_path: &str) {
     if is_url(input_path) {
         log_info("检测到 URL，开始下载图片...");
         if let Some(path) = download_image(input_path) {
-            decode_qrcode(&path);
+            decode_image(&path);
             downloaded_path = Some(path);
         } else {
             log_error("图片下载失败");
         }
     } else {
-        decode_qrcode(&PathBuf::from(input_path));
+        decode_image(&PathBuf::from(input_path));
     }
 
     // 清理下载的临时文件
@@ -375,7 +434,7 @@ fn keep_console_open() {}
 fn main() {
     install_console_guard();
 
-    print!("请输入二维码图片的路径或 URL（多个用逗号分隔）: ");
+    print!("请输入条码图片的路径或 URL（支持二维码和条形码，多个用逗号分隔）: ");
     io::stdout().flush().expect("无法刷新输出缓冲区");
     
     let stdin = io::stdin();
@@ -514,10 +573,26 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_qr_image_blank_returns_none() {
-        // 全白图不会包含二维码
+    fn test_decode_barcode_image_blank_returns_none() {
+        // 全白图不会包含任何条码
         let img = solid_image(32, 32, [255, 255, 255]);
-        assert!(decode_qr_image(&img).is_none());
+        assert!(decode_barcode_image(&img).is_none());
+    }
+
+    #[test]
+    fn test_format_display_name_common_variants() {
+        assert_eq!(format_display_name(&BarcodeFormat::QR_CODE), "二维码 (QR Code)");
+        assert_eq!(format_display_name(&BarcodeFormat::EAN_13), "EAN-13 商品条码");
+        assert_eq!(format_display_name(&BarcodeFormat::CODE_128), "Code 128 条码");
+        assert_eq!(format_display_name(&BarcodeFormat::CODE_39), "Code 39 条码");
+        assert_eq!(format_display_name(&BarcodeFormat::UPC_A), "UPC-A 商品条码");
+        assert_eq!(format_display_name(&BarcodeFormat::ITF), "ITF (二五码) 条码");
+    }
+
+    #[test]
+    fn test_format_display_name_unknown_fallback() {
+        // 未并列的变体应回退到"未知格式"
+        assert_eq!(format_display_name(&BarcodeFormat::UNSUPORTED_FORMAT), "未知格式");
     }
 
     #[test]
